@@ -56,6 +56,15 @@ pub enum OrtAccelerator {
     /// kernels; uses its own threadpool independent of the session intra-op pool.
     #[serde(rename = "xnnpack")]
     Xnnpack = 8,
+    /// Intel OpenVINO (CPU/GPU/NPU). Requires `ort-openvino` feature.
+    /// Uses OpenVINO default device selection unless overridden via
+    /// HANDY_OPENVINO_DEVICE / OPENVINO_DEVICE env (e.g. CPU, GPU, NPU).
+    #[serde(rename = "openvino")]
+    OpenVino = 9,
+    /// Intel NPU via OpenVINO Execution Provider (`device_type=NPU`).
+    /// Requires `ort-openvino` feature and Intel NPU hardware + drivers.
+    #[serde(rename = "npu")]
+    Npu = 10,
 }
 
 static ORT_ACCELERATOR: AtomicU8 = AtomicU8::new(OrtAccelerator::Auto as u8);
@@ -102,6 +111,12 @@ impl OrtAccelerator {
         #[cfg(feature = "ort-xnnpack")]
         v.push(OrtAccelerator::Xnnpack);
 
+        #[cfg(feature = "ort-openvino")]
+        {
+            v.push(OrtAccelerator::OpenVino);
+            v.push(OrtAccelerator::Npu);
+        }
+
         v
     }
 
@@ -116,6 +131,8 @@ impl OrtAccelerator {
             6 => Self::WebGpu,
             7 => Self::TensorRt,
             8 => Self::Xnnpack,
+            9 => Self::OpenVino,
+            10 => Self::Npu,
             _ => Self::Auto,
         }
     }
@@ -139,6 +156,8 @@ impl fmt::Display for OrtAccelerator {
             Self::CoreMl => "coreml",
             Self::WebGpu => "webgpu",
             Self::Xnnpack => "xnnpack",
+            Self::OpenVino => "openvino",
+            Self::Npu => "npu",
         };
         f.write_str(s)
     }
@@ -158,6 +177,8 @@ impl FromStr for OrtAccelerator {
             "coreml" | "core_ml" => Ok(Self::CoreMl),
             "webgpu" | "web_gpu" => Ok(Self::WebGpu),
             "xnnpack" => Ok(Self::Xnnpack),
+            "openvino" | "ov" => Ok(Self::OpenVino),
+            "npu" | "openvino_npu" | "ov_npu" => Ok(Self::Npu),
             other => Err(format!("unknown ORT accelerator: {other}")),
         }
     }
@@ -347,6 +368,8 @@ mod tests {
             OrtAccelerator::CoreMl,
             OrtAccelerator::WebGpu,
             OrtAccelerator::Xnnpack,
+            OrtAccelerator::OpenVino,
+            OrtAccelerator::Npu,
         ] {
             let s = pref.to_string();
             let parsed: OrtAccelerator = s.parse().unwrap();
@@ -372,6 +395,14 @@ mod tests {
             "trt".parse::<OrtAccelerator>().unwrap(),
             OrtAccelerator::TensorRt
         );
+        assert_eq!(
+            "npu".parse::<OrtAccelerator>().unwrap(),
+            OrtAccelerator::Npu
+        );
+        assert_eq!(
+            "openvino".parse::<OrtAccelerator>().unwrap(),
+            OrtAccelerator::OpenVino
+        );
     }
 
     #[test]
@@ -391,6 +422,8 @@ mod tests {
             (OrtAccelerator::CoreMl, "\"coreml\""),
             (OrtAccelerator::WebGpu, "\"webgpu\""),
             (OrtAccelerator::Xnnpack, "\"xnnpack\""),
+            (OrtAccelerator::OpenVino, "\"openvino\""),
+            (OrtAccelerator::Npu, "\"npu\""),
         ] {
             let json = serde_json::to_string(&pref).unwrap();
             assert_eq!(json, expected, "serialize {:?}", pref);
