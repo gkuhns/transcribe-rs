@@ -13,6 +13,8 @@ use ort::ep::CPU;
 use ort::ep::CUDA;
 #[cfg(feature = "ort-xnnpack")]
 use ort::ep::XNNPACK;
+#[cfg(feature = "ort-openvino")]
+use ort::ep::OpenVINO;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -100,6 +102,39 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
                 "Accelerator set to XNNPACK but ort-xnnpack feature is not enabled; falling back to CPU"
             );
         }
+        OrtAccelerator::OpenVino => {
+            #[cfg(feature = "ort-openvino")]
+            {
+                let mut ov = OpenVINO::default();
+                // Optional override: HANDY_OPENVINO_DEVICE or OPENVINO_DEVICE
+                // (CPU | GPU | NPU | AUTO | HETERO:...)
+                if let Ok(dev) = std::env::var("HANDY_OPENVINO_DEVICE")
+                    .or_else(|_| std::env::var("OPENVINO_DEVICE"))
+                {
+                    let dev = dev.trim();
+                    if !dev.is_empty() {
+                        log::info!("OpenVINO device_type override from env: {dev}");
+                        ov = ov.with_device_type(dev.to_string());
+                    }
+                }
+                eps.push(ov.build());
+            }
+            #[cfg(not(feature = "ort-openvino"))]
+            log::warn!(
+                "Accelerator set to OpenVINO but ort-openvino feature is not enabled; falling back to CPU"
+            );
+        }
+        OrtAccelerator::Npu => {
+            #[cfg(feature = "ort-openvino")]
+            {
+                log::info!("OpenVINO EP targeting device_type=NPU");
+                eps.push(OpenVINO::default().with_device_type("NPU".to_string()).build());
+            }
+            #[cfg(not(feature = "ort-openvino"))]
+            log::warn!(
+                "Accelerator set to NPU but ort-openvino feature is not enabled; falling back to CPU"
+            );
+        }
         OrtAccelerator::Auto => {
             // Add compiled-in GPU EPs in priority order.
             // DirectML and WebGPU are excluded from Auto because they require
@@ -115,6 +150,10 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
             eps.push(CUDA::default().build());
             #[cfg(feature = "ort-rocm")]
             eps.push(ROCm::default().build());
+            // OpenVINO before CoreML: on Intel platforms this can select NPU/GPU/CPU.
+            // Explicit Npu variant still forces device_type=NPU.
+            #[cfg(feature = "ort-openvino")]
+            eps.push(OpenVINO::default().build());
             // CoreML is safe for Auto on macOS — analogous to CUDA on NVIDIA
             // and ROCm on AMD. It does not require sequential execution or
             // disabled memory patterns.
