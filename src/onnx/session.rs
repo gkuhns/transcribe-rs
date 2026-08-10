@@ -117,6 +117,14 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
                         ov = ov.with_device_type(dev.to_string());
                     }
                 }
+                match ov.is_available() {
+                    Ok(true) => log::info!("OpenVINO EP available"),
+                    Ok(false) => log::error!(
+                        "OpenVINO EP is NOT available in this ONNX Runtime binary. \
+                         Install OpenVINO Toolkit and a matching ORT build/plugin for Intel acceleration."
+                    ),
+                    Err(e) => log::error!("Failed to query OpenVINO EP availability: {e}"),
+                }
                 eps.push(ov.build());
             }
             #[cfg(not(feature = "ort-openvino"))]
@@ -127,8 +135,32 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
         OrtAccelerator::Npu => {
             #[cfg(feature = "ort-openvino")]
             {
-                log::info!("OpenVINO EP targeting device_type=NPU");
-                eps.push(OpenVINO::default().with_device_type("NPU".to_string()).build());
+                // Force device_type=NPU. Microsoft/pyke prebuilt ORT binaries do NOT
+                // ship the OpenVINO EP — registration will fail unless a custom ORT
+                // (or plugin EP) that includes OpenVINO is loaded. Log clearly so
+                // the user can see why the NPU graph stays flat.
+                let ov = OpenVINO::default().with_device_type("NPU".to_string());
+                match ov.is_available() {
+                    Ok(true) => {
+                        log::info!("OpenVINO EP available — targeting device_type=NPU");
+                        eps.push(ov.build());
+                    }
+                    Ok(false) => {
+                        log::error!(
+                            "OpenVINO EP is NOT available in this ONNX Runtime binary. \
+                             Intel NPU acceleration requires an ORT build (or plugin) that \
+                             includes OpenVINO. Install OpenVINO Toolkit (winget install \
+                             Intel.OpenVINOToolkit.2026.2.0) and use a matching ORT, or the \
+                             NPU graph will stay flat and inference falls back to CPU."
+                        );
+                        // Still request it so ORT logs the registration attempt.
+                        eps.push(ov.build());
+                    }
+                    Err(e) => {
+                        log::error!("Failed to query OpenVINO EP availability: {e}");
+                        eps.push(ov.build());
+                    }
+                }
             }
             #[cfg(not(feature = "ort-openvino"))]
             log::warn!(
