@@ -28,15 +28,34 @@ use crate::accel::{get_ort_accelerator, OrtAccelerator};
 #[path = "openvino_plugin.rs"]
 mod openvino_plugin;
 
+/// Which part of a multi-file ONNX pack this session belongs to.
+///
+/// Decoder / merged-decoder graphs use ONNX `If` plus declared KV-cache
+/// outputs (`present.*.encoder.key`). OpenVINO's frontend cannot convert
+/// those (OpConversionFailure / If-13). Encoders and CTC-only graphs are
+/// the part we pin to the Intel NPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRole {
+    Default,
+    Encoder,
+    Decoder,
+}
+
+fn npu_requested() -> bool {
+    matches!(get_ort_accelerator(), OrtAccelerator::Npu)
+}
+
+fn decoder_must_use_cpu(role: SessionRole) -> bool {
+    npu_requested() && role == SessionRole::Decoder
+}
+
 /// Build the execution provider list based on the global accelerator preference.
-fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
+fn execution_providers(allow_cpu_fallback: bool) -> Vec<ort::ep::ExecutionProviderDispatch> {
     let pref = get_ort_accelerator();
     let mut eps = Vec::new();
 
     match pref {
-        OrtAccelerator::CpuOnly => {
-            // CPU only — no GPU providers
-        }
+        OrtAccelerator::CpuOnly => {}
         OrtAccelerator::Cuda => {
             #[cfg(feature = "ort-cuda")]
             eps.push(CUDA::default().build());
@@ -49,7 +68,6 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
             #[cfg(feature = "ort-tensorrt")]
             {
                 eps.push(TensorRT::default().build());
-                // CUDA as fallback for ops TensorRT doesn't support
                 eps.push(CUDA::default().build());
             }
             #[cfg(not(feature = "ort-tensorrt"))]
@@ -108,8 +126,6 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
             #[cfg(feature = "ort-openvino")]
             {
                 let mut ov = OpenVINO::default();
-                // Optional override: HANDY_OPENVINO_DEVICE or OPENVINO_DEVICE
-                // (CPU | GPU | NPU | AUTO | HETERO:...)
                 if let Ok(dev) = std::env::var("HANDY_OPENVINO_DEVICE")
                     .or_else(|_| std::env::var("OPENVINO_DEVICE"))
                 {
@@ -122,8 +138,7 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
                 match ov.is_available() {
                     Ok(true) => log::info!("OpenVINO EP available"),
                     Ok(false) => log::error!(
-                        "OpenVINO EP is NOT available in this ONNX Runtime binary. \
-                         Install OpenVINO Toolkit and a matching ORT build/plugin for Intel acceleration."
+                        "OpenVINO EP is NOT available in this ONNX Runtime binary."
                     ),
                     Err(e) => log::error!("Failed to query OpenVINO EP availability: {e}"),
                 }
@@ -137,36 +152,19 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
         OrtAccelerator::Npu => {
             #[cfg(feature = "ort-openvino")]
             {
-                // Force device_type=NPU. Microsoft/pyke prebuilt ORT binaries do NOT
-                // ship the OpenVINO EP — registration will fail unless a custom ORT
-                // (or plugin EP) that includes OpenVINO is loaded. Log clearly so
-                // the user can see why the NPU graph stays flat.
                 let ov = OpenVINO::default().with_device_type("NPU".to_string());
                 match ov.is_available() {
-                    Ok(true) => {
-                        log::info!("OpenVINO EP available — targeting device_type=NPU");
-                        eps.push(ov.build());
-                    }
-                    Ok(false) => {
-                        log::error!(
-                            "OpenVINO EP is NOT available in this ONNX Runtime binary. \
-                             Intel NPU acceleration requires an ORT build (or plugin) that \
-                             includes OpenVINO. Install OpenVINO Toolkit (winget install \
-                             Intel.OpenVINOToolkit.2026.2.0) and use a matching ORT, or the \
-                             NPU graph will stay flat and inference falls back to CPU."
-                        );
-                        // Still request it so ORT logs the registration attempt.
-                        eps.push(ov.build());
-                    }
-                    Err(e) => {
-                        log::error!("Failed to query OpenVINO EP availability: {e}");
-                        eps.push(ov.build());
-                    }
+                    Ok(true) => log::info!("OpenVINO EP available — targeting device_type=NPU"),
+                    Ok(false) => log::error!(
+                        "OpenVINO EP is NOT available. NPU session will fail without the plugin."
+                    ),
+                    Err(e) => log::error!("Failed to query OpenVINO EP availability: {e}"),
                 }
+                eps.push(ov.build());
             }
             #[cfg(not(feature = "ort-openvino"))]
             log::warn!(
-                "Accelerator set to NPU but ort-openvino feature is not enabled; falling back to CPU"
+                "Accelerator set to NPU but ort-openvino feature is not enabled"
             );
         }
         OrtAccelerator::Auto => {
@@ -176,7 +174,6 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
             eps.push(CUDA::default().build());
             #[cfg(feature = "ort-rocm")]
             eps.push(ROCm::default().build());
-            // Prefer NPU via OpenVINO when available, then generic OpenVINO, then CPU.
             #[cfg(feature = "ort-openvino")]
             {
                 eps.push(OpenVINO::default().with_device_type("NPU".to_string()).build());
@@ -191,15 +188,13 @@ fn execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
         }
     }
 
-    // Always include CPU as the final fallback.
-    eps.push(CPU::default().build());
+    if allow_cpu_fallback {
+        eps.push(CPU::default().build());
+    }
     eps
 }
 
 fn requires_sequential_session() -> bool {
-    // DirectML and WebGPU require sequential session (no parallel execution).
-    // Ref: https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html
-    //      https://onnxruntime.ai/docs/execution-providers/WebGPU-ExecutionProvider.html
     let pref = get_ort_accelerator();
     matches!(
         pref,
@@ -215,9 +210,26 @@ fn build_session(
     path: &Path,
     intra_threads: Option<usize>,
     parallel_execution: bool,
+    role: SessionRole,
 ) -> Result<Session, ort::Error> {
+    log::info!(
+        "Building ORT session role={role:?} accel={} path={}",
+        get_ort_accelerator(),
+        path.display()
+    );
+
+    if decoder_must_use_cpu(role) {
+        log::warn!(
+            "NPU selected but session role=Decoder ({}) uses ONNX If / KV-cache outputs \
+             that OpenVINO cannot convert (If-13 / present.*.encoder.key). \
+             Loading this graph on CPU EP only. Encoder sessions stay on NPU.",
+            path.display()
+        );
+        return build_cpu_only_session(path, intra_threads, parallel_execution);
+    }
+
     let mut builder =
-        Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
+        Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level1)?;
 
     if is_xnnpack_active() {
         builder = builder.with_intra_op_spinning(false)?;
@@ -249,21 +261,32 @@ fn build_session(
                 openvino_plugin::ensure_registered();
                 match openvino_plugin::apply_devices(builder, pref == OrtAccelerator::Npu) {
                     Ok((mut b, true)) => {
-                        log::info!("Session using OpenVINO EP via plugin device selection");
+                        log::info!(
+                            "Session using OpenVINO EP via plugin device selection (role={role:?})"
+                        );
                         b.commit_from_file(path)?
+                    }
+                    Ok((_b, false)) if pref == OrtAccelerator::Npu => {
+                        return Err(ort::Error::new(
+                            "NPU required but no OpenVINO NPU device was discovered after plugin registration",
+                        ));
                     }
                     Ok((b, false)) => {
                         log::warn!(
-                            "OpenVINO plugin devices unavailable; falling back to classic EP list \
-                             (likely no OpenVINO EP in this ORT binary)"
+                            "OpenVINO plugin devices unavailable; using classic EP list"
                         );
-                        b.with_execution_providers(execution_providers())?
+                        b.with_execution_providers(execution_providers(true))?
                             .commit_from_file(path)?
+                    }
+                    Err(e) if pref == OrtAccelerator::Npu => {
+                        return Err(ort::Error::new(format!(
+                            "NPU required; OpenVINO plugin device selection failed: {e}"
+                        )));
                     }
                     Err(e) => {
                         log::error!("OpenVINO plugin device selection failed: {e}; falling back");
                         let mut builder2 = Session::builder()?
-                            .with_optimization_level(GraphOptimizationLevel::Level3)?;
+                            .with_optimization_level(GraphOptimizationLevel::Level1)?;
                         if is_xnnpack_active() {
                             builder2 = builder2.with_intra_op_spinning(false)?;
                             builder2 = builder2.with_intra_threads(1)?;
@@ -282,13 +305,13 @@ fn build_session(
                             builder2 = builder2.with_memory_pattern(false)?;
                         }
                         builder2
-                            .with_execution_providers(execution_providers())?
+                            .with_execution_providers(execution_providers(true))?
                             .commit_from_file(path)?
                     }
                 }
             } else {
                 builder
-                    .with_execution_providers(execution_providers())?
+                    .with_execution_providers(execution_providers(true))?
                     .commit_from_file(path)?
             }
         }
@@ -296,7 +319,7 @@ fn build_session(
         {
             let _ = pref;
             builder
-                .with_execution_providers(execution_providers())?
+                .with_execution_providers(execution_providers(true))?
                 .commit_from_file(path)?
         }
     };
@@ -319,18 +342,41 @@ fn build_session(
     Ok(session)
 }
 
+fn build_cpu_only_session(
+    path: &Path,
+    intra_threads: Option<usize>,
+    parallel_execution: bool,
+) -> Result<Session, ort::Error> {
+    let mut builder =
+        Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
+    if let Some(n) = intra_threads {
+        if n > 0 {
+            builder = builder.with_intra_threads(n)?;
+        }
+    }
+    builder = builder.with_parallel_execution(parallel_execution)?;
+    let session = builder
+        .with_execution_providers(vec![CPU::default().build()])?
+        .commit_from_file(path)?;
+    Ok(session)
+}
+
 pub fn create_session(path: &Path) -> Result<Session, ort::Error> {
-    build_session(path, None, true)
+    build_session(path, None, true, SessionRole::Default)
+}
+
+pub fn create_session_encoder(path: &Path) -> Result<Session, ort::Error> {
+    build_session(path, None, true, SessionRole::Encoder)
+}
+
+pub fn create_session_decoder(path: &Path) -> Result<Session, ort::Error> {
+    build_session(path, None, true, SessionRole::Decoder)
 }
 
 pub fn create_session_with_threads(path: &Path, num_threads: usize) -> Result<Session, ort::Error> {
-    build_session(path, Some(num_threads), true)
+    build_session(path, Some(num_threads), true, SessionRole::Default)
 }
 
-/// Resolve a model file path for the requested quantization level.
-///
-/// Looks for `{name}.{suffix}.onnx` based on the quantization variant,
-/// falling back to `{name}.onnx` (FP32) if the requested file doesn't exist.
 pub fn resolve_model_path(
     dir: &Path,
     name: &str,
@@ -360,13 +406,11 @@ pub fn resolve_model_path(
     dir.join(format!("{}.onnx", name))
 }
 
-/// Read a custom metadata string from an ONNX session.
 pub fn read_metadata_str(session: &Session, key: &str) -> Result<Option<String>, ort::Error> {
     let meta = session.metadata()?;
     Ok(meta.custom(key).filter(|s| !s.is_empty()))
 }
 
-/// Read a custom metadata i32 value, with optional default.
 pub fn read_metadata_i32(
     session: &Session,
     key: &str,
@@ -383,7 +427,6 @@ pub fn read_metadata_i32(
     }
 }
 
-/// Read a comma-separated float vector from metadata.
 pub fn read_metadata_float_vec(
     session: &Session,
     key: &str,
