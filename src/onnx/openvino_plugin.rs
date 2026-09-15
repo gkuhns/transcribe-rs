@@ -4,7 +4,7 @@
 //! register Intel's `onnxruntime_providers_openvino.dll` plugin and select
 //! devices via the ORT V2 EP device API.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use ort::environment::Environment;
@@ -23,7 +23,6 @@ fn candidate_plugin_paths() -> Vec<PathBuf> {
             }
         }
     }
-    // Common locations after winget / archive OpenVINO install or manual plugin drop.
     let extras = [
         r"C:\Program Files\Intel\OpenVINO\onnxruntime_providers_openvino.dll",
         r"C:\Program Files (x86)\Intel\OpenVINO\onnxruntime_providers_openvino.dll",
@@ -34,7 +33,6 @@ fn candidate_plugin_paths() -> Vec<PathBuf> {
     for e in extras {
         paths.push(PathBuf::from(e));
     }
-    // Alongside the running executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             paths.push(dir.join("onnxruntime_providers_openvino.dll"));
@@ -44,11 +42,8 @@ fn candidate_plugin_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Attempt once to register Intel's OpenVINO EP plugin with the current ORT environment.
-/// Safe to call repeatedly; subsequent calls reuse the first result.
 pub fn ensure_registered() -> bool {
     let result = OPENVINO_EP_LIB.get_or_init(|| {
-        // Ensure environment exists
         let env = Environment::current().map_err(|e| format!("Environment::current failed: {e}"))?;
 
         let mut last_err = String::from("no candidate plugin paths found");
@@ -76,8 +71,7 @@ pub fn ensure_registered() -> bool {
         Err(e) => {
             log::error!(
                 "OpenVINO EP plugin not registered ({e}). Place onnxruntime_providers_openvino.dll \
-                 next to the app or set HANDY_OPENVINO_EP_LIBRARY. \
-                 Install OpenVINO Runtime: winget install --id Intel.OpenVINOToolkit.2026.2.0 -e"
+                 next to the app or set HANDY_OPENVINO_EP_LIBRARY."
             );
             false
         }
@@ -86,6 +80,9 @@ pub fn ensure_registered() -> bool {
 
 /// Apply OpenVINO (optionally NPU-only) devices to a session builder via the V2 API.
 /// Returns true if at least one device was applied.
+///
+/// Attaching both `OpenVINOExecutionProvider` and `OpenVINOExecutionProvider.AUTO`
+/// at once has aborted native graph compile on Intel NPU. We keep a single device.
 pub fn apply_devices(
     builder: ort::session::builder::SessionBuilder,
     prefer_npu: bool,
@@ -100,7 +97,6 @@ pub fn apply_devices(
             if !(ep_l.contains("openvino") || ep_l.contains("ov")) {
                 return false;
             }
-            // ort 2.0.0-rc.12: Device exposes ty()/id() directly (no hardware_device()).
             let ty = dev.ty();
             if prefer_npu {
                 ty == DeviceType::NPU
@@ -117,7 +113,20 @@ pub fn apply_devices(
         return Ok((builder, false));
     }
 
-    for d in &devices {
+    let mut primary = Vec::new();
+    let mut auto_devs = Vec::new();
+    for d in devices {
+        let ep = d.ep().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        if ep.contains("auto") {
+            auto_devs.push(d);
+        } else {
+            primary.push(d);
+        }
+    }
+    let mut selected = if !primary.is_empty() { primary } else { auto_devs };
+    selected.truncate(1);
+
+    for d in &selected {
         if let Ok(ep) = d.ep() {
             log::info!(
                 "Selecting OpenVINO device: ep={ep} hw={:?} id={}",
@@ -135,6 +144,6 @@ pub fn apply_devices(
             "AUTO".to_string()
         },
     )];
-    let builder = builder.with_devices(devices, Some(&options))?;
+    let builder = builder.with_devices(selected, Some(&options))?;
     Ok((builder, true))
 }
