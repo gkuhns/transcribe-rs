@@ -3,6 +3,10 @@
 //! Microsoft/pyke prebuilt ORT does not include OpenVINO. At runtime we try to
 //! register Intel's `onnxruntime_providers_openvino.dll` plugin and select
 //! devices via the ORT V2 EP device API.
+//!
+//! The plugin MUST NOT sit next to onnxruntime.dll. ORT auto-loads sibling
+//! provider DLLs, which then hijacks Silero VAD and CPU decoder graphs through
+//! the OpenVINO ONNX frontend (If-13 / If-16 conversion failures).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -23,23 +27,31 @@ fn candidate_plugin_paths() -> Vec<PathBuf> {
             }
         }
     }
-    let extras = [
-        r"C:\Program Files\Intel\OpenVINO\onnxruntime_providers_openvino.dll",
-        r"C:\Program Files (x86)\Intel\OpenVINO\onnxruntime_providers_openvino.dll",
-        r"C:\Program Files\onnxruntime-ep-openvino\onnxruntime_providers_openvino.dll",
-        "onnxruntime_providers_openvino.dll",
-        "plugins/onnxruntime_providers_openvino.dll",
-    ];
-    for e in extras {
-        paths.push(PathBuf::from(e));
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            paths.push(dir.join("onnxruntime_providers_openvino.dll"));
+            paths.push(dir.join("openvino-ep").join("onnxruntime_providers_openvino.dll"));
             paths.push(dir.join("plugins").join("onnxruntime_providers_openvino.dll"));
         }
     }
     paths
+}
+
+fn prepend_plugin_dir_to_path(plugin: &std::path::Path) {
+    if let Some(dir) = plugin.parent() {
+        let extra = dir.display().to_string();
+        let key = "PATH";
+        let joined = match std::env::var_os(key) {
+            Some(existing) => {
+                let mut combined = std::ffi::OsString::from(&extra);
+                combined.push(";");
+                combined.push(existing);
+                combined
+            }
+            None => std::ffi::OsString::from(extra),
+        };
+        unsafe { std::env::set_var(key, joined) };
+        log::info!("Prepended OpenVINO EP dir to PATH: {}", dir.display());
+    }
 }
 
 pub fn ensure_registered() -> bool {
@@ -51,6 +63,7 @@ pub fn ensure_registered() -> bool {
             if !path.exists() {
                 continue;
             }
+            prepend_plugin_dir_to_path(&path);
             log::info!("Attempting to register OpenVINO EP plugin from {}", path.display());
             match env.register_ep_library("openvino_ep", &path) {
                 Ok(handle) => {
@@ -58,7 +71,7 @@ pub fn ensure_registered() -> bool {
                     return Ok(handle);
                 }
                 Err(e) => {
-                    last_err = format!("{}: {e}", path.display());
+                    last_err = format!("{path}: {e}", path = path.display());
                     log::warn!("Failed to register OpenVINO EP plugin from {}: {e}", path.display());
                 }
             }
@@ -70,8 +83,8 @@ pub fn ensure_registered() -> bool {
         Ok(_) => true,
         Err(e) => {
             log::error!(
-                "OpenVINO EP plugin not registered ({e}). Place onnxruntime_providers_openvino.dll \
-                 next to the app or set HANDY_OPENVINO_EP_LIBRARY."
+                "OpenVINO EP plugin not registered ({e}). Place the DLL under openvino-ep/ next to the app \
+                 or set HANDY_OPENVINO_EP_LIBRARY."
             );
             false
         }
