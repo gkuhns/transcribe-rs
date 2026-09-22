@@ -64,11 +64,12 @@ impl MoonshineModel {
             return Err(TranscribeError::ModelNotFound(decoder_path));
         }
 
-        log::info!("Loading Moonshine encoder from {:?}...", encoder_path);
-        let encoder = session::create_session(&encoder_path)?;
-
+        // Decoder first: CPU-only session before OpenVINO EP is registered.
         log::info!("Loading Moonshine decoder from {:?}...", decoder_path);
-        let decoder = session::create_session(&decoder_path)?;
+        let decoder = session::create_session_decoder(&decoder_path)?;
+
+        log::info!("Loading Moonshine encoder from {:?}...", encoder_path);
+        let encoder = session::create_session_encoder(&encoder_path)?;
 
         let encoder_input_names: Vec<String> = encoder
             .inputs()
@@ -93,7 +94,6 @@ impl MoonshineModel {
         })
     }
 
-    /// Transcribe with model-specific parameters.
     pub fn transcribe_with(
         &mut self,
         samples: &[f32],
@@ -272,8 +272,6 @@ impl SpeechModel for MoonshineModel {
     }
 }
 
-// ---- KV Cache ----
-
 struct KVCache {
     cache: HashMap<String, ArrayD<f32>>,
     num_layers: usize,
@@ -343,8 +341,6 @@ impl KVCache {
         Ok(())
     }
 }
-
-// ---- Tokenizer ----
 
 struct MoonshineTokenizer {
     vocab: HashMap<u32, String>,
