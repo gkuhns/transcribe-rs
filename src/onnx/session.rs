@@ -39,6 +39,29 @@ fn npu_requested() -> bool {
     matches!(get_ort_accelerator(), OrtAccelerator::Npu)
 }
 
+fn enable_ort_verbose_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let pairs = [
+            ("ORT_LOG_LEVEL", "VERBOSE"),
+            ("ORT_LOG_SEVERITY_LEVEL", "0"),
+            ("OPENVINO_LOG_LEVEL", "3"),
+            ("OV_LOG_LEVEL", "3"),
+            ("NPU_LOG_LEVEL", "LOG_INFO"),
+        ];
+        for (key, value) in pairs {
+            if std::env::var_os(key).is_none() {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+        log::info!(
+            "ORT/OpenVINO native log env ORT_LOG_LEVEL={} OPENVINO_LOG_LEVEL={}",
+            std::env::var("ORT_LOG_LEVEL").unwrap_or_default(),
+            std::env::var("OPENVINO_LOG_LEVEL").unwrap_or_default()
+        );
+    });
+}
+
 fn file_name_lower(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
@@ -185,18 +208,31 @@ fn is_xnnpack_active() -> bool {
     matches!(get_ort_accelerator(), OrtAccelerator::Xnnpack)
 }
 
+fn describe_onnx(path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(meta) => log::info!(
+            "ONNX file exists path={} bytes={} ",
+            path.display(),
+            meta.len()
+        ),
+        Err(e) => log::error!("ONNX file missing path={} err={e}", path.display()),
+    }
+}
+
 fn build_session(
     path: &Path,
     intra_threads: Option<usize>,
     parallel_execution: bool,
     role: SessionRole,
 ) -> Result<Session, ort::Error> {
+    enable_ort_verbose_logs();
     let role = infer_role(path, role);
     log::info!(
         "Building ORT session role={role:?} accel={} path={}",
         get_ort_accelerator(),
         path.display()
     );
+    describe_onnx(path);
 
     if let Some(reason) = must_use_cpu(path, role) {
         log::warn!(
@@ -224,6 +260,7 @@ fn build_session(
     }
 
     let pref = get_ort_accelerator();
+    log::info!("Committing ORT session from file on accel={pref:?} role={role:?}");
     let session = {
         #[cfg(feature = "ort-openvino")]
         {
@@ -271,6 +308,7 @@ fn build_session(
             builder.with_execution_providers(execution_providers(true))?.commit_from_file(path)?
         }
     };
+    log::info!("ORT session commit succeeded role={role:?} path={}", path.display());
 
     for input in session.inputs() {
         log::info!("Model input: name={}, type={:?}", input.name(), input.dtype());
@@ -287,6 +325,7 @@ fn build_cpu_only_session(
     parallel_execution: bool,
 ) -> Result<Session, ort::Error> {
     log::info!("Building CPU-only ORT session path={}", path.display());
+    describe_onnx(path);
     let mut builder = Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
     if let Some(n) = intra_threads {
         if n > 0 {
