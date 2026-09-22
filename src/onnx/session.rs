@@ -211,7 +211,7 @@ fn is_xnnpack_active() -> bool {
 fn describe_onnx(path: &Path) {
     match std::fs::metadata(path) {
         Ok(meta) => log::info!(
-            "ONNX file exists path={} bytes={} ",
+            "ONNX file exists path={} bytes={}",
             path.display(),
             meta.len()
         ),
@@ -326,7 +326,22 @@ fn build_cpu_only_session(
 ) -> Result<Session, ort::Error> {
     log::info!("Building CPU-only ORT session path={}", path.display());
     describe_onnx(path);
-    let mut builder = Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
+    if npu_requested() {
+        if let Ok(meta) = std::fs::metadata(path) {
+            const LIMIT: u64 = 200_000_000;
+            if meta.len() > LIMIT {
+                return Err(ort::Error::new(format!(
+                    "Refusing to compile {} ({} bytes) on CPU while NPU is selected. \
+                     This int8 Parakeet graph cannot run on Intel NPU and a CPU compile of this size aborts the process. \
+                     Use Moonshine Base (fp32 ONNX) for NPU, or set the ONNX accelerator to CPU.",
+                    path.display(),
+                    meta.len()
+                )));
+            }
+        }
+    }
+    log::info!("CPU commit_from_file starting path={}", path.display());
+    let mut builder = Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level1)?;
     if let Some(n) = intra_threads {
         if n > 0 {
             builder = builder.with_intra_threads(n)?;
@@ -367,6 +382,11 @@ pub fn resolve_model_path(
     name: &str,
     quantization: &super::Quantization,
 ) -> std::path::PathBuf {
+    let fp32 = dir.join(format!("{}.onnx", name));
+    if npu_requested() && fp32.exists() {
+        log::info!("NPU: preferring fp32 graph {}", fp32.display());
+        return fp32;
+    }
     let suffix = match quantization {
         super::Quantization::FP32 => None,
         super::Quantization::FP16 => Some("fp16"),
@@ -379,9 +399,14 @@ pub fn resolve_model_path(
             log::info!("Loading {} model: {}", suffix, path.display());
             return path;
         }
-        log::warn!("{} model not found at {}, falling back to {}.onnx", suffix, path.display(), name);
+        log::warn!(
+            "{} model not found at {}, falling back to {}.onnx",
+            suffix,
+            path.display(),
+            name
+        );
     }
-    dir.join(format!("{}.onnx", name))
+    fp32
 }
 
 pub fn read_metadata_str(session: &Session, key: &str) -> Result<Option<String>, ort::Error> {
