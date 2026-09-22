@@ -39,24 +39,36 @@ fn npu_requested() -> bool {
     matches!(get_ort_accelerator(), OrtAccelerator::Npu)
 }
 
+fn file_name_lower(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 fn infer_role(path: &Path, explicit: SessionRole) -> SessionRole {
     if explicit != SessionRole::Default {
         return explicit;
     }
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if name.contains("decoder") {
+    if file_name_lower(path).contains("decoder") {
         SessionRole::Decoder
     } else {
         SessionRole::Encoder
     }
 }
 
-fn decoder_must_use_cpu(role: SessionRole) -> bool {
-    npu_requested() && role == SessionRole::Decoder
+fn must_use_cpu(path: &Path, role: SessionRole) -> Option<&'static str> {
+    if !npu_requested() {
+        return None;
+    }
+    if role == SessionRole::Decoder {
+        return Some("decoder graphs use ONNX If / KV-cache outputs OpenVINO cannot convert");
+    }
+    let name = file_name_lower(path);
+    if name.contains("int8") || name.contains("int4") || name.contains("uint8") {
+        return Some("int8/int4 graphs abort native OpenVINO NPU compile on this device");
+    }
+    None
 }
 
 fn execution_providers(allow_cpu_fallback: bool) -> Vec<ort::ep::ExecutionProviderDispatch> {
@@ -186,11 +198,9 @@ fn build_session(
         path.display()
     );
 
-    if decoder_must_use_cpu(role) {
+    if let Some(reason) = must_use_cpu(path, role) {
         log::warn!(
-            "NPU selected but session role=Decoder ({}) uses ONNX If / KV-cache outputs \
-             that OpenVINO cannot convert (If-13 / present.*.encoder.key). \
-             Loading this graph on CPU EP only. Encoder sessions stay on NPU.",
+            "NPU selected but this graph stays on CPU EP ({reason}): {}",
             path.display()
         );
         return build_cpu_only_session(path, intra_threads, parallel_execution);
@@ -276,6 +286,7 @@ fn build_cpu_only_session(
     intra_threads: Option<usize>,
     parallel_execution: bool,
 ) -> Result<Session, ort::Error> {
+    log::info!("Building CPU-only ORT session path={}", path.display());
     let mut builder = Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3)?;
     if let Some(n) = intra_threads {
         if n > 0 {
@@ -283,7 +294,17 @@ fn build_cpu_only_session(
         }
     }
     builder = builder.with_parallel_execution(parallel_execution)?;
-    builder.with_execution_providers(vec![CPU::default().build()])?.commit_from_file(path)
+    let session = builder
+        .with_execution_providers(vec![CPU::default().build()])?
+        .commit_from_file(path)?;
+    log::info!("CPU-only ORT session ready path={}", path.display());
+    for input in session.inputs() {
+        log::info!("Model input: name={}, type={:?}", input.name(), input.dtype());
+    }
+    for output in session.outputs() {
+        log::info!("Model output: name={}, type={:?}", output.name(), output.dtype());
+    }
+    Ok(session)
 }
 
 pub fn create_session(path: &Path) -> Result<Session, ort::Error> {
